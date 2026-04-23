@@ -1,0 +1,21 @@
+name: Run push_notes_app (via GITHUB_TOKEN)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  run-push-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (with credentials)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true  # allows git push using the provided token
+
+      - name: Ensure script is executable
+        run: chmod +x ./push_notes_app.sh
+
+      - name: Run push_notes_app.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # automatically injected
+        run: ./push_notes_app.sh
