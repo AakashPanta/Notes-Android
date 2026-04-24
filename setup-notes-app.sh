@@ -782,4 +782,1088 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   if (req.method === "GET") {
-    const note = await prisma.note.findFirs
+    const note = await prisma.note.findFirst({
+      where: {
+        id,
+        authorId: user.id
+      },
+      include: {
+        tags: true,
+        notebook: true,
+        versions: {
+          orderBy: {
+            createdAt: "desc"
+          },
+          take: 50
+        }
+      }
+    });
+
+    if (!note) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    return res.status(200).json(note);
+  }
+
+  if (req.method === "PUT") {
+    const existing = await prisma.note.findFirst({
+      where: {
+        id,
+        authorId: user.id
+      }
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    const title =
+      typeof req.body.title === "string" && req.body.title.trim()
+        ? req.body.title.trim()
+        : existing.title;
+
+    const content = typeof req.body.content === "string" ? req.body.content : existing.content;
+    const tags = normalizeTags(req.body.tags);
+    const plainText = stripHtml(content);
+
+    const updated = await prisma.note.update({
+      where: {
+        id
+      },
+      data: {
+        title,
+        content,
+        plainText,
+        isPinned: typeof req.body.isPinned === "boolean" ? req.body.isPinned : existing.isPinned,
+        isArchived: typeof req.body.isArchived === "boolean" ? req.body.isArchived : existing.isArchived,
+        isEncrypted:
+          typeof req.body.isEncrypted === "boolean" ? req.body.isEncrypted : existing.isEncrypted,
+        versionCount: {
+          increment: 1
+        },
+        tags: {
+          set: [],
+          connectOrCreate: tags.map((name) => ({
+            where: {
+              ownerId_name: {
+                ownerId: user.id,
+                name
+              }
+            },
+            create: {
+              ownerId: user.id,
+              name
+            }
+          }))
+        },
+        versions: {
+          create: {
+            content,
+            authorId: user.id
+          }
+        }
+      },
+      include: {
+        tags: true,
+        notebook: true
+      }
+    });
+
+    return res.status(200).json(updated);
+  }
+
+  if (req.method === "DELETE") {
+    const existing = await prisma.note.findFirst({
+      where: {
+        id,
+        authorId: user.id
+      }
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    await prisma.note.delete({
+      where: {
+        id
+      }
+    });
+
+    return res.status(200).json({ ok: true });
+  }
+
+  res.setHeader("Allow", "GET, PUT, DELETE");
+  return res.status(405).json({ error: "Method not allowed" });
+}
+EOF
+
+# ============================================================
+# Editor component
+# ============================================================
+
+cat > components/Editor.tsx << 'EOF'
+import dynamic from "next/dynamic";
+
+const ReactQuill = dynamic(() => import("react-quill"), {
+  ssr: false,
+  loading: () => <div className="editor-loading">Loading editor...</div>
+});
+
+const modules = {
+  toolbar: [
+    [{ header: [1, 2, 3, false] }],
+    ["bold", "italic", "underline", "strike"],
+    [{ list: "ordered" }, { list: "bullet" }],
+    ["blockquote", "code-block"],
+    ["link"],
+    ["clean"]
+  ]
+};
+
+export default function Editor({
+  value,
+  onChange
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return <ReactQuill theme="snow" value={value} onChange={onChange} modules={modules} />;
+}
+EOF
+
+# ============================================================
+# Next app wrapper
+# ============================================================
+
+cat > pages/_app.tsx << 'EOF'
+import type { AppProps } from "next/app";
+import { useEffect } from "react";
+import { SessionProvider } from "next-auth/react";
+import "react-quill/dist/quill.snow.css";
+import "../styles/globals.css";
+
+export default function App({ Component, pageProps: { session, ...pageProps } }: AppProps) {
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "production") return;
+    if (!("serviceWorker" in navigator)) return;
+
+    navigator.serviceWorker.register("/sw.js").catch((error) => {
+      console.error("Service worker registration failed", error);
+    });
+  }, []);
+
+  return (
+    <SessionProvider session={session}>
+      <Component {...pageProps} />
+    </SessionProvider>
+  );
+}
+EOF
+
+# ============================================================
+# Home page
+# ============================================================
+
+cat > pages/index.tsx << 'EOF'
+import axios from "axios";
+import Link from "next/link";
+import { signIn, signOut, useSession } from "next-auth/react";
+import { useMemo, useState } from "react";
+import useSWR from "swr";
+
+const fetcher = (url: string) => axios.get(url).then((response) => response.data);
+
+type NoteListItem = {
+  id: string;
+  title: string;
+  plainText: string;
+  isPinned: boolean;
+  updatedAt: string;
+  tags: {
+    id: string;
+    name: string;
+  }[];
+};
+
+export default function Home() {
+  const { data: session, status } = useSession();
+  const [q, setQ] = useState("");
+
+  const notesUrl = useMemo(() => {
+    if (!session) return null;
+
+    const params = new URLSearchParams();
+
+    if (q.trim()) {
+      params.set("q", q.trim());
+    }
+
+    const suffix = params.toString();
+
+    return `/api/notes${suffix ? `?${suffix}` : ""}`;
+  }, [q, session]);
+
+  const { data: notes, mutate, isLoading } = useSWR<NoteListItem[]>(notesUrl, fetcher);
+
+  async function createNote() {
+    const response = await axios.post("/api/notes", {
+      title: "New note",
+      content: "<p></p>",
+      tags: []
+    });
+
+    await mutate();
+
+    window.location.href = `/note/${response.data.id}`;
+  }
+
+  return (
+    <main className="app-shell">
+      <section className="hero-card">
+        <div>
+          <p className="eyebrow">Production Notes</p>
+          <h1>Private, searchable, revision-safe notes.</h1>
+          <p className="subtitle">
+            A clean Next.js + Prisma notes app foundation with authentication, rich editing, tags,
+            archive state, revision history, and CI-ready structure.
+          </p>
+        </div>
+
+        <div className="auth-panel">
+          {status === "loading" ? (
+            <span>Checking session...</span>
+          ) : session ? (
+            <>
+              <span className="signed-in">
+                Signed in as {session.user?.email || session.user?.name}
+              </span>
+              <button className="secondary-button" onClick={() => signOut()}>
+                Sign out
+              </button>
+            </>
+          ) : (
+            <button className="primary-button" onClick={() => signIn()}>
+              Sign in
+            </button>
+          )}
+        </div>
+      </section>
+
+      {session ? (
+        <section className="notes-card">
+          <div className="toolbar">
+            <input
+              aria-label="Search notes"
+              placeholder="Search notes..."
+              value={q}
+              onChange={(event) => setQ(event.target.value)}
+            />
+            <button className="primary-button" onClick={createNote}>
+              New Note
+            </button>
+          </div>
+
+          {isLoading ? <p className="muted">Loading notes...</p> : null}
+
+          <div className="notes-grid">
+            {notes?.map((note) => (
+              <Link key={note.id} href={`/note/${note.id}`} className="note-card">
+                <div className="note-card-top">
+                  <h2>{note.title}</h2>
+                  {note.isPinned ? <span className="pin">Pinned</span> : null}
+                </div>
+
+                <p>{note.plainText || "No content yet."}</p>
+
+                <div className="note-meta">
+                  <span>{new Date(note.updatedAt).toLocaleString()}</span>
+                  <span>{note.tags.map((tag) => tag.name).join(", ")}</span>
+                </div>
+              </Link>
+            ))}
+          </div>
+
+          {!isLoading && notes?.length === 0 ? (
+            <p className="muted">No notes found. Create your first note.</p>
+          ) : null}
+        </section>
+      ) : (
+        <section className="notes-card">
+          <p className="muted">Sign in to create and manage your notes.</p>
+        </section>
+      )}
+    </main>
+  );
+}
+EOF
+
+# ============================================================
+# Note editor page
+# ============================================================
+
+cat > pages/note/[id].tsx << 'EOF'
+import axios from "axios";
+import { useRouter } from "next/router";
+import { useEffect, useState } from "react";
+import useSWR from "swr";
+import Editor from "../../components/Editor";
+
+const fetcher = (url: string) => axios.get(url).then((response) => response.data);
+
+type Note = {
+  id: string;
+  title: string;
+  content: string;
+  isPinned: boolean;
+  isArchived: boolean;
+  tags: {
+    id: string;
+    name: string;
+  }[];
+  versions: {
+    id: string;
+    createdAt: string;
+  }[];
+};
+
+export default function NotePage() {
+  const router = useRouter();
+  const id = typeof router.query.id === "string" ? router.query.id : "";
+
+  const { data: note, mutate, isLoading } = useSWR<Note>(
+    id ? `/api/notes/${id}` : null,
+    fetcher
+  );
+
+  const [title, setTitle] = useState("");
+  const [content, setContent] = useState("");
+  const [tagText, setTagText] = useState("");
+  const [isPinned, setIsPinned] = useState(false);
+  const [isArchived, setIsArchived] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+
+  useEffect(() => {
+    if (!note) return;
+
+    setTitle(note.title || "Untitled");
+    setContent(note.content || "");
+    setTagText(note.tags?.map((tag) => tag.name).join(", ") || "");
+    setIsPinned(Boolean(note.isPinned));
+    setIsArchived(Boolean(note.isArchived));
+  }, [note]);
+
+  async function save() {
+    if (!id) return;
+
+    setIsSaving(true);
+
+    try {
+      await axios.put(`/api/notes/${id}`, {
+        title,
+        content,
+        isPinned,
+        isArchived,
+        tags: tagText
+          .split(",")
+          .map((tag) => tag.trim())
+          .filter(Boolean)
+      });
+
+      await mutate();
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function remove() {
+    if (!id) return;
+
+    const confirmed = window.confirm("Delete this note permanently?");
+
+    if (!confirmed) return;
+
+    await axios.delete(`/api/notes/${id}`);
+    await router.push("/");
+  }
+
+  if (isLoading || !note) {
+    return <main className="app-shell">Loading note...</main>;
+  }
+
+  return (
+    <main className="app-shell">
+      <section className="editor-card">
+        <div className="editor-header">
+          <button className="secondary-button" onClick={() => router.push("/")}>
+            Back
+          </button>
+
+          <div className="editor-actions">
+            <button className="secondary-button danger" onClick={remove}>
+              Delete
+            </button>
+
+            <button className="primary-button" onClick={save} disabled={isSaving}>
+              {isSaving ? "Saving..." : "Save"}
+            </button>
+          </div>
+        </div>
+
+        <input
+          className="title-input"
+          aria-label="Note title"
+          value={title}
+          onChange={(event) => setTitle(event.target.value)}
+        />
+
+        <div className="metadata-row">
+          <label>
+            <input
+              type="checkbox"
+              checked={isPinned}
+              onChange={(event) => setIsPinned(event.target.checked)}
+            />
+            Pinned
+          </label>
+
+          <label>
+            <input
+              type="checkbox"
+              checked={isArchived}
+              onChange={(event) => setIsArchived(event.target.checked)}
+            />
+            Archived
+          </label>
+        </div>
+
+        <input
+          className="tag-input"
+          aria-label="Tags"
+          placeholder="Tags, separated by commas"
+          value={tagText}
+          onChange={(event) => setTagText(event.target.value)}
+        />
+
+        <Editor value={content} onChange={setContent} />
+      </section>
+
+      <section className="versions-card">
+        <h2>Versions</h2>
+
+        <ul>
+          {note.versions?.map((version) => (
+            <li key={version.id}>{new Date(version.createdAt).toLocaleString()}</li>
+          ))}
+        </ul>
+      </section>
+    </main>
+  );
+}
+EOF
+
+# ============================================================
+# Global styles
+# ============================================================
+
+cat > styles/globals.css << 'EOF'
+:root {
+  color-scheme: light dark;
+  --background: #f4f5f7;
+  --foreground: #111827;
+  --muted: #6b7280;
+  --card: rgba(255, 255, 255, 0.82);
+  --border: rgba(17, 24, 39, 0.12);
+  --primary: #111827;
+  --primary-text: #ffffff;
+  --danger: #b91c1c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #05070b;
+    --foreground: #f9fafb;
+    --muted: #9ca3af;
+    --card: rgba(17, 24, 39, 0.86);
+    --border: rgba(255, 255, 255, 0.12);
+    --primary: #ffffff;
+    --primary-text: #111827;
+    --danger: #f87171;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top left, rgba(99, 102, 241, 0.18), transparent 34rem),
+    var(--background);
+  color: var(--foreground);
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.app-shell {
+  width: min(1120px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 32px 0;
+}
+
+.hero-card,
+.notes-card,
+.editor-card,
+.versions-card {
+  border: 1px solid var(--border);
+  background: var(--card);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.12);
+  backdrop-filter: blur(16px);
+  border-radius: 28px;
+}
+
+.hero-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 32px;
+  margin-bottom: 24px;
+}
+
+.eyebrow {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  max-width: 760px;
+  margin-bottom: 12px;
+  font-size: clamp(2rem, 5vw, 4.5rem);
+  line-height: 0.96;
+  letter-spacing: -0.06em;
+}
+
+.subtitle {
+  max-width: 680px;
+  color: var(--muted);
+  font-size: 1.05rem;
+  line-height: 1.7;
+}
+
+.auth-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 12px;
+  min-width: 220px;
+}
+
+.signed-in,
+.muted {
+  color: var(--muted);
+}
+
+.primary-button,
+.secondary-button {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 10px 16px;
+  transition:
+    transform 160ms ease,
+    opacity 160ms ease;
+}
+
+.primary-button:hover,
+.secondary-button:hover {
+  transform: translateY(-1px);
+}
+
+.primary-button {
+  background: var(--primary);
+  color: var(--primary-text);
+}
+
+.secondary-button {
+  background: transparent;
+  color: var(--foreground);
+}
+
+.secondary-button.danger {
+  color: var(--danger);
+}
+
+.notes-card,
+.editor-card,
+.versions-card {
+  padding: 24px;
+}
+
+.toolbar,
+.editor-header,
+.editor-actions,
+.metadata-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.toolbar,
+.editor-header {
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.toolbar input,
+.title-input,
+.tag-input {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--foreground);
+  border-radius: 18px;
+  padding: 12px 14px;
+  outline: none;
+}
+
+.toolbar input:focus,
+.title-input:focus,
+.tag-input:focus {
+  border-color: currentColor;
+}
+
+.notes-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px;
+}
+
+.note-card {
+  display: flex;
+  min-height: 180px;
+  flex-direction: column;
+  justify-content: space-between;
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  padding: 18px;
+  color: inherit;
+  text-decoration: none;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.note-card-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.note-card h2 {
+  margin-bottom: 10px;
+  font-size: 1.15rem;
+}
+
+.note-card p {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--muted);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+
+.note-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.pin {
+  height: fit-content;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.editor-card {
+  margin-bottom: 24px;
+}
+
+.title-input {
+  margin-bottom: 16px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  padding-left: 0;
+  font-size: clamp(1.8rem, 4vw, 3rem);
+  font-weight: 800;
+  letter-spacing: -0.04em;
+}
+
+.metadata-row {
+  margin-bottom: 16px;
+  color: var(--muted);
+}
+
+.metadata-row label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tag-input {
+  margin-bottom: 16px;
+}
+
+.editor-loading {
+  min-height: 260px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 24px;
+  color: var(--muted);
+}
+
+.ql-toolbar.ql-snow,
+.ql-container.ql-snow {
+  border-color: var(--border) !important;
+}
+
+.ql-toolbar.ql-snow {
+  border-top-left-radius: 18px;
+  border-top-right-radius: 18px;
+}
+
+.ql-container.ql-snow {
+  min-height: 360px;
+  border-bottom-left-radius: 18px;
+  border-bottom-right-radius: 18px;
+  font-size: 1rem;
+}
+
+.ql-editor {
+  min-height: 360px;
+}
+
+.versions-card ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+@media (max-width: 720px) {
+  .hero-card,
+  .toolbar,
+  .editor-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .auth-panel {
+    align-items: stretch;
+  }
+
+  .editor-actions {
+    justify-content: space-between;
+  }
+}
+EOF
+
+# ============================================================
+# Service worker
+# ============================================================
+
+cat > public/sw.js << 'EOF'
+const CACHE_NAME = "production-notes-v1";
+const SHELL_ASSETS = ["/"];
+
+self.addEventListener("install", (event) => {
+  self.skipWaiting();
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL_ASSETS)));
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key)))
+      )
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  if (event.request.method !== "GET") return;
+
+  const url = new URL(event.request.url);
+
+  if (url.pathname.startsWith("/api/")) return;
+
+  event.respondWith(
+    fetch(event.request)
+      .then((response) => {
+        const copy = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        return response;
+      })
+      .catch(() => caches.match(event.request).then((cached) => cached || caches.match("/")))
+  );
+});
+EOF
+
+# ============================================================
+# Docker
+# ============================================================
+
+cat > docker-compose.yml << 'EOF'
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: notesdb
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d notesdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    command: sh -c "npm run db:push && npm run db:search-index && npm run dev"
+    restart: unless-stopped
+    volumes:
+      - .:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: "postgresql://postgres:postgres@db:5432/notesdb?schema=public"
+      NEXTAUTH_URL: "http://localhost:3000"
+      NEXTAUTH_SECRET: "change-this-secret-before-production"
+      EMAIL_SERVER: "smtp://user:pass@smtp.example.com:587"
+      EMAIL_FROM: "Notes App <no-reply@example.com>"
+      GITHUB_ID: ""
+      GITHUB_SECRET: ""
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db-data:
+EOF
+
+cat > Dockerfile << 'EOF'
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package.json ./
+RUN npm install
+
+COPY . .
+
+RUN npm run prisma:generate
+RUN npm run build
+
+EXPOSE 3000
+
+CMD ["npm", "run", "start"]
+EOF
+
+# ============================================================
+# Tests
+# ============================================================
+
+cat > tests/prisma.test.ts << 'EOF'
+import { prisma } from "../lib/prisma";
+
+afterAll(async () => {
+  await prisma.$disconnect();
+});
+
+describe("database smoke test", () => {
+  it("connects to PostgreSQL", async () => {
+    const result = await prisma.$queryRaw<{ now: Date }[]>`select now()`;
+    expect(result[0]?.now).toBeDefined();
+  });
+});
+EOF
+
+# ============================================================
+# GitHub Actions CI
+# ============================================================
+
+cat > .github/workflows/ci.yml << 'EOF'
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: notesdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d notesdb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/notesdb?schema=public
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ci-secret-do-not-use-in-production
+      EMAIL_SERVER: smtp://user:pass@smtp.example.com:587
+      EMAIL_FROM: Notes App <no-reply@example.com>
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Push Prisma schema to test database
+        run: npx prisma db push --skip-generate
+
+      - name: Create PostgreSQL search index
+        run: npm run db:search-index
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+EOF
+
+# ============================================================
+# License
+# ============================================================
+
+cat > LICENSE << 'EOF'
+MIT License
+
+Copyright (c) 2026 AakashPanta
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+EOF
+
+# ============================================================
+# Gitignore
+# ============================================================
+
+cat > .gitignore << 'EOF'
+node_modules
+.env
+.env.local
+.next
+.DS_Store
+coverage
+dist
+*.log
+EOF
+
+# ============================================================
+# Done
+# ============================================================
+
+echo ""
+echo "✅ Production Notes App files created successfully."
+echo ""
+echo "Next steps:"
+echo "1. cp .env.example .env"
+echo "2. npm install"
+echo "3. npx prisma generate"
+echo "4. npm run dev"
+echo ""
+echo "Open:"
+echo "http://localhost:3000"
+echo ""
+echo "Docker option:"
+echo "docker compose up --build"

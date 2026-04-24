@@ -1,0 +1,152 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ShareRole {
+  VIEWER
+  EDITOR
+}
+
+model User {
+  id             String       @id @default(cuid())
+  name           String?
+  email          String?      @unique
+  emailVerified  DateTime?
+  image          String?
+
+  accounts       Account[]
+  sessions       Session[]
+  notes          Note[]       @relation("UserNotes")
+  notebooks      Notebook[]
+  tags           Tag[]
+  sharedNotes    SharedNote[] @relation("SharedWithUser")
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+}
+
+model Account {
+  id                 String  @id @default(cuid())
+  userId             String
+  type               String
+  provider           String
+  providerAccountId  String
+  refresh_token      String? @db.Text
+  access_token       String? @db.Text
+  expires_at         Int?
+  token_type         String?
+  scope              String?
+  id_token           String? @db.Text
+  session_state      String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id            String   @id @default(cuid())
+  sessionToken  String   @unique
+  userId        String
+  expires       DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Notebook {
+  id        String   @id @default(cuid())
+  title     String
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  notes     Note[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([ownerId, title])
+  @@index([ownerId])
+}
+
+model Tag {
+  id        String   @id @default(cuid())
+  name      String
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  notes     Note[]   @relation("NoteTags")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([ownerId, name])
+  @@index([ownerId])
+}
+
+model Note {
+  id           String        @id @default(cuid())
+  title        String
+  content      String        @db.Text
+  plainText    String        @db.Text
+  authorId     String
+  author       User          @relation("UserNotes", fields: [authorId], references: [id], onDelete: Cascade)
+  notebookId   String?
+  notebook     Notebook?     @relation(fields: [notebookId], references: [id], onDelete: SetNull)
+  tags         Tag[]         @relation("NoteTags")
+  isPinned     Boolean       @default(false)
+  isArchived   Boolean       @default(false)
+  isEncrypted  Boolean       @default(false)
+  versionCount Int           @default(0)
+  versions     NoteVersion[]
+  shared       SharedNote[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([authorId])
+  @@index([notebookId])
+  @@index([isArchived])
+  @@index([isPinned])
+  @@index([updatedAt])
+}
+
+model NoteVersion {
+  id        String   @id @default(cuid())
+  noteId    String
+  note      Note     @relation(fields: [noteId], references: [id], onDelete: Cascade)
+  content   String   @db.Text
+  diff      String?  @db.Text
+  authorId  String?
+  createdAt DateTime @default(now())
+
+  @@index([noteId])
+  @@index([createdAt])
+}
+
+model SharedNote {
+  id               String    @id @default(cuid())
+  noteId           String
+  note             Note      @relation(fields: [noteId], references: [id], onDelete: Cascade)
+  sharedWithEmail  String?
+  sharedWithUserId String?
+  sharedWithUser   User?     @relation("SharedWithUser", fields: [sharedWithUserId], references: [id], onDelete: Cascade)
+  role             ShareRole @default(VIEWER)
+  expiresAt        DateTime?
+  passwordHash     String?
+  createdAt        DateTime  @default(now())
+
+  @@index([noteId])
+  @@index([sharedWithEmail])
+  @@index([sharedWithUserId])
+}
